@@ -17,6 +17,7 @@
 from dataclasses import dataclass, field
 
 from lerobot.configs import NormalizationMode, PreTrainedConfig
+from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.optim import AdamConfig, DiffuserSchedulerConfig
 
 
@@ -100,8 +101,37 @@ class DiffusionConfig(PreTrainedConfig):
 
     # Inputs / output structure.
     n_obs_steps: int = 2
-    horizon: int = 16
-    n_action_steps: int = 8
+    # horizon: int = 16 : default 
+    horizon: int = 32
+    # n_action_steps: int = 8 : default
+    n_action_steps: int = 30
+
+    input_features: dict = field(
+        default_factory=lambda: {
+            # 3 cameras (head_right 제외)
+            "observation.images.head_rgb":        PolicyFeature(type=FeatureType.VISUAL, shape=(3, 96, 96)),
+            "observation.images.left_wrist_rgb":  PolicyFeature(type=FeatureType.VISUAL, shape=(3, 96, 96)),
+            "observation.images.right_wrist_rgb": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 96, 96)),
+            # sub-feature state keys (normalization용)
+            "observation.state.left_arm":         PolicyFeature(type=FeatureType.STATE, shape=(6,)),
+            "observation.state.right_arm":        PolicyFeature(type=FeatureType.STATE, shape=(6,)),
+            "observation.state.left_gripper":     PolicyFeature(type=FeatureType.STATE, shape=(1,)),
+            "observation.state.right_gripper":    PolicyFeature(type=FeatureType.STATE, shape=(1,)),
+            # combined state: [la(6), ra(6), lg(1), rg(1)] = 14-dim
+            "observation.state":                  PolicyFeature(type=FeatureType.STATE, shape=(14,)),
+        }
+    )
+    output_features: dict = field(
+        default_factory=lambda: {
+            # sub-feature action keys (normalization용)
+            "action.left_gripper":  PolicyFeature(type=FeatureType.ACTION, shape=(1,)),
+            "action.right_gripper": PolicyFeature(type=FeatureType.ACTION, shape=(1,)),
+            "action.left_arm":      PolicyFeature(type=FeatureType.ACTION, shape=(6,)),
+            "action.right_arm":     PolicyFeature(type=FeatureType.ACTION, shape=(6,)),
+            # combined action: [lg(1), rg(1), la(6), ra(6)] = 14-dim (POLICY ordering)
+            "action":               PolicyFeature(type=FeatureType.ACTION, shape=(14,)),
+        }
+    )
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -113,27 +143,32 @@ class DiffusionConfig(PreTrainedConfig):
 
     # The original implementation doesn't sample frames for the last 7 steps,
     # which avoids excessive padding and leads to improved training results.
-    drop_n_last_frames: int = 7  # horizon - n_action_steps - n_obs_steps + 1
+    drop_n_last_frames: int = 1  # horizon - n_action_steps - n_obs_steps + 1
 
     # Architecture / modeling.
     # Vision backbone.
     vision_backbone: str = "resnet18"
-    resize_shape: tuple[int, int] | None = None
+    # resize_shape: tuple[int, int] | None = None : default
+    # resize_shape: tuple[int, int] | None = (224, 224)
+    resize_shape: tuple[int, int] | None = (96, 96)
     crop_ratio: float = 1.0
     crop_shape: tuple[int, int] | None = None
     crop_is_random: bool = True
     pretrained_backbone_weights: str | None = None
     use_group_norm: bool = True
-    spatial_softmax_num_keypoints: int = 32
+    spatial_softmax_num_keypoints: int = 32 # default
+    # spatial_softmax_num_keypoints: int = 16
     use_separate_rgb_encoder_per_camera: bool = False
     # Unet.
-    down_dims: tuple[int, ...] = (512, 1024, 2048)
+    down_dims: tuple[int, ...] = (512, 1024, 2048) # default
+    # down_dims: tuple[int, ...] = (256, 512, 1024)
     kernel_size: int = 5
     n_groups: int = 8
     diffusion_step_embed_dim: int = 128
     use_film_scale_modulation: bool = True
     # Noise scheduler.
-    noise_scheduler_type: str = "DDPM"
+    # noise_scheduler_type: str = "DDPM" : default
+    noise_scheduler_type: str = "DDIM"
     num_train_timesteps: int = 100
     beta_schedule: str = "squaredcos_cap_v2"
     beta_start: float = 0.0001
@@ -143,7 +178,8 @@ class DiffusionConfig(PreTrainedConfig):
     clip_sample_range: float = 1.0
 
     # Inference
-    num_inference_steps: int | None = None
+    # num_inference_steps: int | None = None : default
+    num_inference_steps: int = 20
 
     # Optimization
     compile_model: bool = False
@@ -162,6 +198,17 @@ class DiffusionConfig(PreTrainedConfig):
 
     def __post_init__(self):
         super().__post_init__()
+
+        # When loading from a checkpoint, features are deserialized as plain dicts.
+        # Convert them back to PolicyFeature objects.
+        for attr in ("input_features", "output_features"):
+            features = getattr(self, attr) or {}
+            first = next(iter(features.values()), None)
+            if isinstance(first, dict):
+                setattr(self, attr, {
+                    k: PolicyFeature(type=FeatureType(v["type"]), shape=tuple(v["shape"]))
+                    for k, v in features.items()
+                })
 
         """Input validation (not exhaustive)."""
         if not self.vision_backbone.startswith("resnet"):
@@ -235,8 +282,15 @@ class DiffusionConfig(PreTrainedConfig):
                         f"for `crop_shape` and {image_ft.shape} for `{key}`."
                     )
 
-        # Check that all input images have the same shape.
-        if len(self.image_features) > 0:
+        # # Check that all input images have the same shape.
+        # if len(self.image_features) > 0:
+        #     first_image_key, first_image_ft = next(iter(self.image_features.items()))
+        #     for key, image_ft in self.image_features.items():
+        #         if image_ft.shape != first_image_ft.shape:
+        #             raise ValueError(
+        #                 f"`{key}` does not match `{first_image_key}`, but we expect all image shapes to match."
+        #             )
+        if len(self.image_features) > 0 and self.resize_shape is None:  # 조건 추가
             first_image_key, first_image_ft = next(iter(self.image_features.items()))
             for key, image_ft in self.image_features.items():
                 if image_ft.shape != first_image_ft.shape:

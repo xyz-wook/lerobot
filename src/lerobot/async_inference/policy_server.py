@@ -28,6 +28,7 @@ import logging
 import pickle  # nosec
 import threading
 import time
+import traceback
 from concurrent import futures
 from dataclasses import asdict
 from pprint import pformat
@@ -168,6 +169,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         self.logger.info(f"Time taken to put policy on {self.device}: {end - start:.4f} seconds")
 
+        self._inject_combined_action_stats()
+
         return services_pb2.Empty()
 
     def SendObservations(self, request_iterator, context):  # noqa: N802
@@ -225,12 +228,13 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 f"Running inference for observation #{obs.get_timestep()} (must_go: {obs.must_go})"
             )
 
-            with self._predicted_timesteps_lock:
-                self._predicted_timesteps.add(obs.get_timestep())
-
             start_time = time.perf_counter()
             action_chunk = self._predict_action_chunk(obs)
             inference_time = time.perf_counter() - start_time
+
+            # Mark timestep as predicted only AFTER successful inference
+            with self._predicted_timesteps_lock:
+                self._predicted_timesteps.add(obs.get_timestep())
 
             start_time = time.perf_counter()
             actions_bytes = pickle.dumps(action_chunk)  # nosec
@@ -261,7 +265,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             return services_pb2.Empty()
 
         except Exception as e:
-            self.logger.error(f"Error in StreamActions: {e}")
+            self.logger.error(f"Error in StreamActions: {e}\n{traceback.format_exc()}")
 
             return services_pb2.Empty()
 
@@ -309,6 +313,62 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         return False
 
+    def _inject_combined_action_stats(self) -> None:
+        """Build combined 'action' stats from per-sub-feature stats if the model only saved sub-feature stats.
+
+        Some checkpoints store per-sub-feature stats (action.left_arm, etc.) in the safetensors but omit
+        the combined 'action' (26-dim) key. The unnormalizer looks up _tensor_stats["action"], so without
+        this injection it silently skips unnormalization and sends [-1,1] normalized values to the robot.
+        """
+        from lerobot.configs import FeatureType
+        from lerobot.processor.normalize_processor import UnnormalizerProcessorStep
+
+        for step in self.postprocessor.steps:
+            if not isinstance(step, UnnormalizerProcessorStep):
+                continue
+            if "action" in step._tensor_stats:
+                return  # combined stats already present
+
+            # Sub-features in the order defined by the postprocessor's features dict
+            sub_keys = [
+                k for k, v in step.features.items()
+                if v.type == FeatureType.ACTION and k != "action"
+            ]
+            if not sub_keys:
+                return
+
+            missing = [k for k in sub_keys if k not in step._tensor_stats]
+            if missing:
+                self.logger.warning(f"Cannot inject combined action stats: missing sub-feature stats {missing}")
+                return
+
+            # Concatenate per-sub-feature stats along the feature dimension
+            any_sub = step._tensor_stats[sub_keys[0]]
+            combined: dict[str, torch.Tensor] = {}
+            for stat_name, stat_val in any_sub.items():
+                if stat_name == "count":
+                    combined[stat_name] = stat_val
+                else:
+                    combined[stat_name] = torch.cat(
+                        [step._tensor_stats[k][stat_name] for k in sub_keys]
+                    )
+
+            # Must update BOTH _tensor_stats AND self.stats.
+            # When device changes, self.to() rebuilds _tensor_stats from self.stats,
+            # so writing only to _tensor_stats causes the key to disappear on device switch.
+            step._tensor_stats["action"] = combined
+            step.stats["action"] = {
+                k: v.cpu().numpy() if v.numel() > 1 else float(v.item())
+                for k, v in combined.items()
+            }
+
+            sample_shape = next(v for k, v in combined.items() if k != "count").shape
+            self.logger.info(
+                f"Built combined action stats for unnormalization from sub-features {sub_keys}, "
+                f"combined shape={sample_shape}"
+            )
+            return
+
     def _time_action_chunk(self, t_0: float, action_chunk: list[torch.Tensor], i_0: int) -> list[TimedAction]:
         """Turn a chunk of actions into a list of TimedAction instances,
         with the first action corresponding to t_0 and the rest corresponding to
@@ -320,8 +380,31 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         ]
 
     def _get_action_chunk(self, observation: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Get an action chunk from the policy. The chunk contains only"""
-        chunk = self.policy.predict_action_chunk(observation)
+        """Get an action chunk from the policy."""
+        from lerobot.policies.utils import populate_queues
+        from lerobot.utils.constants import ACTION, OBS_IMAGES
+
+        # Mirror select_action preprocessing: resize images and stack into OBS_IMAGES
+        batch = dict(observation)
+
+        # The preprocessor pipeline (transition_to_batch) injects "action": None into the output.
+        # select_action pops it before populate_queues; we must do the same or populate_queues
+        # will fill _queues["action"] with None, causing torch.stack to fail.
+        batch.pop(ACTION, None)
+
+        if self.policy.config.image_features:
+            batch = self.policy._resize_images_in_batch(batch, list(self.policy.config.image_features))
+            batch[OBS_IMAGES] = torch.stack(
+                [batch[key] for key in self.policy.config.image_features], dim=-4
+            )
+
+        # Reset queues and fill with current obs n_obs_steps times.
+        # Without reset, the queue accumulates obs ~1s apart (vs 32ms during training),
+        # causing distribution shift after the first inference. Resetting mirrors the
+        # episode-start behavior from training where the same obs fills the queue.
+        self.policy.reset()
+        self.policy._queues = populate_queues(self.policy._queues, batch)
+        chunk = self.policy.predict_action_chunk(batch)
         if chunk.ndim != 3:
             chunk = chunk.unsqueeze(0)  # adding batch dimension, now shape is (B, chunk_size, action_dim)
 
@@ -360,22 +443,16 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             f"Preprocessing and inference took {inference_time:.4f}s, action shape: {action_tensor.shape}"
         )
 
-        """4. Apply postprocessor"""
-        # Apply postprocessor (handles unnormalization and device movement)
-        # Postprocessor expects (B, action_dim) per action, but we have (B, chunk_size, action_dim)
-        # So we process each action in the chunk individually
+        """4. Apply postprocessor (unnormalization, device movement)"""
         start_postprocess = time.perf_counter()
         _, chunk_size, _ = action_tensor.shape
 
-        # Process each action in the chunk
         processed_actions = []
         for i in range(chunk_size):
-            # Extract action at timestep i: (B, action_dim)
             single_action = action_tensor[:, i, :]
             processed_action = self.postprocessor(single_action)
             processed_actions.append(processed_action)
 
-        # Stack back to (B, chunk_size, action_dim), then remove batch dim
         action_tensor = torch.stack(processed_actions, dim=1).squeeze(0)
         self.logger.debug(f"Postprocessed action shape: {action_tensor.shape}")
 
@@ -388,9 +465,17 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         postprocess_stops = time.perf_counter()
         postprocessing_time = postprocess_stops - start_postprocess
 
+        # Log first action of chunk for diagnosis (unnormalized, physical units)
+        first_action = action_tensor[0].numpy()
+        labels = ["lgr", "rgr", "cvx", "cvy", "cvz", "cv3", "cv4", "cv5",
+                  "tv0", "tv1", "tv2", "tv3", "tv4", "tv5",
+                  "la0", "la1", "la2", "la3", "la4", "la5",
+                  "ra0", "ra1", "ra2", "ra3", "ra4", "ra5"]
+        act_str = " ".join(f"{l}={v:.2f}" for l, v in zip(labels, first_action))
         self.logger.info(
             f"Observation {observation_t.get_timestep()} | "
-            f"Total time: {1000 * (postprocess_stops - start_prepare):.2f}ms"
+            f"Total time: {1000 * (postprocess_stops - start_prepare):.2f}ms | "
+            f"action[0]: {act_str}"
         )
 
         self.logger.debug(

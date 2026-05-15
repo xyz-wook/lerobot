@@ -58,6 +58,10 @@ from lerobot.robots import (  # noqa: F401
     omx_follower,
     so_follower,
 )
+try:
+    from lerobot.robots import r1lite  # noqa: F401
+except ImportError:
+    pass
 from lerobot.transport import (
     services_pb2,  # type: ignore
     services_pb2_grpc,  # type: ignore

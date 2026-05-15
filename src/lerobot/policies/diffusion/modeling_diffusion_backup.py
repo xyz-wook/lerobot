@@ -28,7 +28,6 @@ from typing import TYPE_CHECKING
 import einops
 import numpy as np
 import torch
-import torch.nn.functional as F
 import torch.nn.functional as F  # noqa: N812
 import torchvision
 from torch import Tensor, nn
@@ -137,7 +136,6 @@ class DiffusionPolicy(PreTrainedPolicy):
 
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch = self._resize_images_in_batch(batch, list(self.config.image_features))
             batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
         # NOTE: It's important that this happens after stacking the images into a single key.
         self._queues = populate_queues(self._queues, batch)
@@ -149,25 +147,6 @@ class DiffusionPolicy(PreTrainedPolicy):
         action = self._queues[ACTION].popleft()
         return action
 
-    def _resize_images_in_batch(self, batch: dict, keys: list) -> dict:
-        """Stack 전에 모든 카메라 이미지를 resize_shape으로 통일한다.
-        카메라마다 해상도가 다를 때(예: head 720x1280, wrist 360x640) 필요."""
-        if self.config.resize_shape is None:
-            return batch
-        target_h, target_w = self.config.resize_shape
-        for key in keys:
-            img = batch[key]          # (..., C, H, W)
-            orig_shape = img.shape
-            h, w = orig_shape[-2], orig_shape[-1]
-            if h == target_h and w == target_w:
-                continue              # 이미 올바른 크기
-            # leading dims를 flatten해서 (N, C, H, W)로 만든 뒤 interpolate
-            flat = img.reshape(-1, orig_shape[-3], h, w).float()
-            resized = F.interpolate(flat, size=(target_h, target_w),
-                                    mode="bilinear", align_corners=False)
-            batch[key] = resized.reshape(*orig_shape[:-2], target_h, target_w)
-        return batch
-
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
         """Run the batch through the model and compute the loss for training or validation."""
         if self.config.image_features:
@@ -175,7 +154,6 @@ class DiffusionPolicy(PreTrainedPolicy):
             for key in self.config.image_features:
                 if self.config.n_obs_steps == 1 and batch[key].ndim == 4:
                     batch[key] = batch[key].unsqueeze(1)
-            batch = self._resize_images_in_batch(batch, list(self.config.image_features))
             batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
         loss = self.diffusion.compute_loss(batch)
         # no output_dict so returning None
