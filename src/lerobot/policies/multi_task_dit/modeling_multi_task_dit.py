@@ -166,7 +166,21 @@ class MultiTaskDiTPolicy(PreTrainedPolicy):
         """Prepare batch by stacking image features if needed."""
         if self.config.image_features:
             batch = dict(batch)  # shallow copy to avoid modifying original
-            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+            if self.observation_encoder.do_resize:
+                # Resize each camera to a common shape before stacking (handles mixed resolutions)
+                image_list = []
+                for key in self.config.image_features:
+                    img = batch[key]  # (B, T, C, H, W)
+                    b, t, c, h, w = img.shape
+                    img = self.observation_encoder.resize(img.reshape(b * t, c, h, w))
+                    image_list.append(img.reshape(b, t, c, *img.shape[-2:]))
+                    del batch[key]  # free original high-res tensor immediately
+                batch[OBS_IMAGES] = torch.stack(image_list, dim=-4)
+            else:
+                images = [batch[key] for key in self.config.image_features]
+                for key in self.config.image_features:
+                    del batch[key]
+                batch[OBS_IMAGES] = torch.stack(images, dim=-4)
 
         return batch
 
