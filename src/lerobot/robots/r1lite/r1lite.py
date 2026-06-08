@@ -1,20 +1,25 @@
 """
 R1Lite LeRobot 로봇 구현 — ROS2 토픽 기반 Async Inference 클라이언트
 
-두 가지 모드:
-  "full"    : 전체 observation (64-dim state, 4 cameras) / action (26-dim)
-  "partial" : 부분 observation (14-dim state, 3 cameras) / action (14-dim)  ← r1lite_config.py 기준
+세 가지 모드:
+  "full"    : 전체 observation (64-dim state, 4 cameras) / action (26-dim) — v2.1 서브키 형태
+  "partial" : 부분 observation (14-dim 개별 서브키, 3 cameras) / action (14-dim 개별 서브키) — diffusion용
+  "flat"    : flat observation (14-dim observation.state, 3 cameras) / action (14-dim action) — multi_task_dit (v3.0)용
 
 observation.state 차원 구성
   full (64):    left_arm.pos(6) + left_arm.vel(6) + right_arm.pos(6) + right_arm.vel(6)
                 + imu(10) + chassis.pos(3) + chassis.vel(3) + torso.pos(4) + torso.vel(4)
                 + left_gripper(1) + right_gripper(1) + left_ee(7) + right_ee(7)
-  partial (14): left_arm.pos(6) + right_arm.pos(6) + left_gripper(1) + right_gripper(1)
+  partial (14): left_gripper(1) + right_gripper(1) + left_arm(6) + right_arm(6) — 개별 서브키
+  flat (14):    left_arm(6) + right_arm(6) + left_gripper(1) + right_gripper(1)
+                → "observation.state" 단일 키로 반환 (v3.0 flat 형태)
 
-action 차원 구성  (modality.json 순서 기준)
+action 차원 구성
   full (26):    left_gripper(1) + right_gripper(1) + chassis.vel(6) + torso.vel(6)
-                + left_arm(6) + right_arm(6)
-  partial (14): left_gripper(1) + right_gripper(1) + left_arm(6) + right_arm(6)
+                + left_arm(6) + right_arm(6)   (modality.json 순서, 서브키 형태)
+  partial (14): left_gripper(1) + right_gripper(1) + left_arm(6) + right_arm(6) — 개별 서브키
+  flat (14):    left_arm(6) + right_arm(6) + left_gripper(1) + right_gripper(1)
+                → "action" 단일 키로 수신 (v3.0 flat 형태, 학습 dataset 순서와 일치)
 """
 
 import threading
@@ -36,9 +41,8 @@ from lerobot.types import RobotAction, RobotObservation
 # from lerobot.processor import RobotAction, RobotObservation
 
 
-
 # ─────────────────────────────────────────────
-# 상수: action 차원 슬라이스 (modality.json 기준)
+# 상수: action 차원 슬라이스
 # ─────────────────────────────────────────────
 _FULL_ACT_SLICES = {
     "left_gripper":  (0, 1),
@@ -49,12 +53,24 @@ _FULL_ACT_SLICES = {
     "right_arm":     (20, 26),
 }
 
+# partial 모드: left_gripper(0,1) + right_gripper(1,2) + left_arm(2,8) + right_arm(8,14)
 _PARTIAL_ACT_SLICES = {
     "left_gripper":  (0, 1),
     "right_gripper": (1, 2),
     "left_arm":      (2, 8),
     "right_arm":     (8, 14),
 }
+
+# flat 모드 (v3.0): left_arm(0,6) + right_arm(6,12) + left_gripper(12,13) + right_gripper(13,14)
+_FLAT_ACT_SLICES = {
+    "left_arm":      (0, 6),
+    "right_arm":     (6, 12),
+    "left_gripper":  (12, 13),
+    "right_gripper": (13, 14),
+}
+
+FLAT_STATE_DIM  = 14  # left_arm(6) + right_arm(6) + left_gripper(1) + right_gripper(1)
+FLAT_ACTION_DIM = 14
 
 
 # ─────────────────────────────────────────────
@@ -111,7 +127,23 @@ def _full_obs_features(head_h, head_w, wrist_h, wrist_w) -> dict:
 
 
 def _partial_obs_features(head_h, head_w, wrist_h, wrist_w) -> dict:
-    """partial 모드 observation_features: 스칼라 14개 + 이미지 3개"""
+    """partial 모드 observation_features: 스칼라 14개 개별 서브키 + 이미지 3개 (diffusion용)"""
+    f = {}
+    f.update(_vec_keys("left_arm.pos", 6))      # [0:6]
+    f.update(_vec_keys("right_arm.pos", 6))     # [6:12]
+    f["left_gripper.pos"] = float               # [12]
+    f["right_gripper.pos"] = float              # [13]
+    f["head_rgb"]        = (head_h,  head_w,  3)
+    f["left_wrist_rgb"]  = (wrist_h, wrist_w, 3)
+    f["right_wrist_rgb"] = (wrist_h, wrist_w, 3)
+    return f
+
+
+def _flat_obs_features(head_h, head_w, wrist_h, wrist_w) -> dict:
+    """flat 모드 observation_features: 스칼라 14개 개별 서브키 + 이미지 3개 (multi_task_dit용)
+    hw_to_dataset_features가 float 값만 state 스칼라로 인식하므로 개별 float 키를 사용해야 함.
+    obs 순서: left_arm.pos(6) + right_arm.pos(6) + left_gripper(1) + right_gripper(1) → observation.state(14)
+    """
     f = {}
     f.update(_vec_keys("left_arm.pos", 6))      # [0:6]
     f.update(_vec_keys("right_arm.pos", 6))     # [6:12]
@@ -136,12 +168,27 @@ def _full_action_features() -> dict:
 
 
 def _partial_action_features() -> dict:
-    """partial 모드 action_features: 스칼라 14개"""
+    """partial 모드 action_features: 스칼라 14개 개별 서브키 (diffusion용)
+    순서: left_gripper(0) + right_gripper(1) + left_arm(2:8) + right_arm(8:14)
+    """
     f = {}
     f["left_gripper"]  = float                  # [0]
     f["right_gripper"] = float                  # [1]
     f.update(_vec_keys("left_arm", 6))          # [2:8]
     f.update(_vec_keys("right_arm", 6))         # [8:14]
+    return f
+
+
+def _flat_action_features() -> dict:
+    """flat 모드 action_features: 스칼라 14개 개별 서브키 (multi_task_dit / v3.0 dataset 순서)
+    _action_tensor_to_action_dict가 키 수:텐서 원소 1:1 매핑이므로 개별 float 키를 사용해야 함.
+    순서: left_arm(0:6) + right_arm(6:12) + left_gripper(12:13) + right_gripper(13:14)
+    """
+    f = {}
+    f.update(_vec_keys("left_arm", 6))    # [0:6]
+    f.update(_vec_keys("right_arm", 6))   # [6:12]
+    f["left_gripper"]  = float            # [12]
+    f["right_gripper"] = float            # [13]
     return f
 
 
@@ -151,8 +198,8 @@ def _partial_action_features() -> dict:
 @RobotConfig.register_subclass("r1lite")
 @dataclass
 class R1LiteConfig(RobotConfig):
-    # "full" or "partial"
-    mode: str = "full"
+    # "full", "partial", or "flat"
+    mode: str = "partial"
 
     # observation 토픽
     topic_arm_left_fb:      str = "/hdas/feedback_arm_left"
@@ -200,8 +247,8 @@ class R1LiteRobot(Robot):
         super().__init__(config)
         self.config = config
 
-        if config.mode not in ("full", "partial"):
-            raise ValueError(f"mode must be 'full' or 'partial', got '{config.mode}'")
+        if config.mode not in ("full", "partial", "flat"):
+            raise ValueError(f"mode must be 'full', 'partial', or 'flat', got '{config.mode}'")
 
         self._connected = False
         self._spin_thread: Optional[threading.Thread] = None
@@ -229,13 +276,19 @@ class R1LiteRobot(Robot):
         wh, ww = self.config.wrist_h, self.config.wrist_w
         if self.config.mode == "full":
             return _full_obs_features(h, w, wh, ww)
-        return _partial_obs_features(h, w, wh, ww)
+        elif self.config.mode == "partial":
+            return _partial_obs_features(h, w, wh, ww)
+        else:  # flat
+            return _flat_obs_features(h, w, wh, ww)
 
     @property
     def action_features(self) -> dict:
         if self.config.mode == "full":
             return _full_action_features()
-        return _partial_action_features()
+        elif self.config.mode == "partial":
+            return _partial_action_features()
+        else:  # flat
+            return _flat_action_features()
 
     @property
     def is_connected(self) -> bool:
@@ -254,7 +307,7 @@ class R1LiteRobot(Robot):
         cfg = self.config
         self.node = Node("lerobot_r1lite")
 
-        # subscriptions (공통)
+        # subscriptions (공통: partial/flat/full 모두)
         self.node.create_subscription(JointState,      cfg.topic_arm_left_fb,      self._cb_arm_l,   10)
         self.node.create_subscription(JointState,      cfg.topic_arm_right_fb,     self._cb_arm_r,   10)
         self.node.create_subscription(JointState,      cfg.topic_gripper_left_fb,  self._cb_grip_l,  10)
@@ -442,6 +495,19 @@ class R1LiteRobot(Robot):
         obs: RobotObservation = {}
 
         if self.config.mode == "partial":
+            # diffusion용: 개별 서브키 반환
+            for i, v in enumerate(arm_l_pos):   obs[f"left_arm.pos.{i}"]  = float(v)
+            for i, v in enumerate(arm_r_pos):   obs[f"right_arm.pos.{i}"] = float(v)
+            obs["left_gripper.pos"]  = float(grip_l)
+            obs["right_gripper.pos"] = float(grip_r)
+            obs["head_rgb"]        = head_img
+            obs["left_wrist_rgb"]  = wrist_l
+            obs["right_wrist_rgb"] = wrist_r
+
+        elif self.config.mode == "flat":
+            # multi_task_dit/v3.0용: 개별 서브키 반환
+            # hw_to_dataset_features가 float 키들을 모아 observation.state(14) 를 자동 구성
+            # 순서: left_arm.pos(6) + right_arm.pos(6) + left_gripper(1) + right_gripper(1)
             for i, v in enumerate(arm_l_pos):   obs[f"left_arm.pos.{i}"]  = float(v)
             for i, v in enumerate(arm_r_pos):   obs[f"right_arm.pos.{i}"] = float(v)
             obs["left_gripper.pos"]  = float(grip_l)
@@ -507,17 +573,31 @@ class R1LiteRobot(Robot):
         if not self._connected:
             raise RuntimeError("Robot is not connected.")
 
-        # action: {feature_key: float} — robot_client._action_tensor_to_action_dict() 출력
-        keys = list(self.action_features.keys())
-        vals = np.array([action[k] for k in keys], dtype=np.float32)
-
         if self.config.mode == "partial":
+            # diffusion용: 개별 서브키 → _PARTIAL_ACT_SLICES
+            # 순서: left_gripper(0) + right_gripper(1) + left_arm(2:8) + right_arm(8:14)
+            keys = list(self.action_features.keys())
+            vals = np.array([action[k] for k in keys], dtype=np.float32)
             s = _PARTIAL_ACT_SLICES
             self._pub_joint_state(self._pub_grip_l, vals[s["left_gripper"][0]:s["left_gripper"][1]])
             self._pub_joint_state(self._pub_grip_r, vals[s["right_gripper"][0]:s["right_gripper"][1]])
             self._pub_joint_state(self._pub_arm_l,  vals[s["left_arm"][0]:s["left_arm"][1]])
             self._pub_joint_state(self._pub_arm_r,  vals[s["right_arm"][0]:s["right_arm"][1]])
-        else:
+
+        elif self.config.mode == "flat":
+            # multi_task_dit/v3.0용: 개별 서브키 → _FLAT_ACT_SLICES
+            # 순서: left_arm(0:6) + right_arm(6:12) + left_gripper(12:13) + right_gripper(13:14)
+            keys = list(self.action_features.keys())
+            vals = np.array([action[k] for k in keys], dtype=np.float32)
+            s = _FLAT_ACT_SLICES
+            self._pub_joint_state(self._pub_arm_l,  vals[s["left_arm"][0]:s["left_arm"][1]])
+            self._pub_joint_state(self._pub_arm_r,  vals[s["right_arm"][0]:s["right_arm"][1]])
+            self._pub_joint_state(self._pub_grip_l, vals[s["left_gripper"][0]:s["left_gripper"][1]])
+            self._pub_joint_state(self._pub_grip_r, vals[s["right_gripper"][0]:s["right_gripper"][1]])
+
+        else:  # full
+            keys = list(self.action_features.keys())
+            vals = np.array([action[k] for k in keys], dtype=np.float32)
             s = _FULL_ACT_SLICES
             self._pub_joint_state(self._pub_grip_l,   vals[s["left_gripper"][0]:s["left_gripper"][1]])
             self._pub_joint_state(self._pub_grip_r,   vals[s["right_gripper"][0]:s["right_gripper"][1]])
