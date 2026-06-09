@@ -162,25 +162,30 @@ class MultiTaskDiTPolicy(PreTrainedPolicy):
         actions = self._generate_actions(batch)
         return actions
 
+    def _resize_images_in_batch(self, batch: dict[str, Tensor], keys: list[str]) -> dict[str, Tensor]:
+        """카메라별 해상도를 image_crop_shape으로 통일. policy_server가 stack 전에 호출."""
+        target = self.config.image_crop_shape
+        if target is None:
+            return batch
+        batch = dict(batch)
+        for key in keys:
+            img = batch[key]
+            if img.shape[-2] != target[0] or img.shape[-1] != target[1]:
+                orig = img.shape
+                flat = img.reshape(-1, orig[-3], orig[-2], orig[-1]).float()
+                flat = F.interpolate(flat, size=target, mode="bilinear", align_corners=False)
+                batch[key] = flat.reshape(*orig[:-2], *target)
+        return batch
+
     def _prepare_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         """Prepare batch by stacking image features if needed."""
         if self.config.image_features:
-            batch = dict(batch)  # shallow copy to avoid modifying original
-            if self.observation_encoder.do_resize:
-                # Resize each camera to a common shape before stacking (handles mixed resolutions)
-                image_list = []
-                for key in self.config.image_features:
-                    img = batch[key]  # (B, T, C, H, W)
-                    b, t, c, h, w = img.shape
-                    img = self.observation_encoder.resize(img.reshape(b * t, c, h, w))
-                    image_list.append(img.reshape(b, t, c, *img.shape[-2:]))
-                    del batch[key]  # free original high-res tensor immediately
-                batch[OBS_IMAGES] = torch.stack(image_list, dim=-4)
-            else:
-                images = [batch[key] for key in self.config.image_features]
-                for key in self.config.image_features:
-                    del batch[key]
-                batch[OBS_IMAGES] = torch.stack(images, dim=-4)
+            # policy_server가 이미 resize+stack을 했으면 스킵 (훈련 시에는 직접 처리)
+            if OBS_IMAGES in batch:
+                return batch
+            batch = dict(batch)
+            batch = self._resize_images_in_batch(batch, list(self.config.image_features))
+            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
 
         return batch
 

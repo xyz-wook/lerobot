@@ -225,7 +225,8 @@ class MultiTaskDiTConfig(PreTrainedConfig):
                     self.image_crop_shape = None
                     break
 
-        if len(self.image_features) > 0:
+        # image_crop_shape이 있으면 _prepare_batch에서 stack 전에 리사이즈하므로 shape 불일치 허용
+        if len(self.image_features) > 0 and self.image_crop_shape is None:
             first_key, first_ft = next(iter(self.image_features.items()))
             for key, image_ft in self.image_features.items():
                 if image_ft.shape != first_ft.shape:
